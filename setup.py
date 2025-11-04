@@ -14,7 +14,7 @@ setup(
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name), glob('launch/*.launch.py')),
     ],
-    install_requires=['setuptools', 'PyQt5'],
+    install_requires=['setuptools', 'PyQt5', 'numpy', 'opencv-python'],
     python_requires='>=3.8',
     zip_safe=True,
     maintainer='Dexter Ong',
@@ -24,5 +24,6 @@ setup(
     tests_require=['pytest'],
     entry_points={'console_scripts': [
         'velocity_flow_gui = velocity_flow_manager.velocity_flow_gui:main',
+        'velocity_flow_manager = velocity_flow_manager.velocity_flow_manager:main',
     ]},
 )

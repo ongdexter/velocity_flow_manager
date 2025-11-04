@@ -13,16 +13,11 @@ import threading
 from PyQt5 import QtWidgets, QtCore
 PYQT_AVAILABLE = True
 
-import numpy as np
-import cv2
-
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
 from std_srvs.srv import Trigger
 from kr_tracker_msgs.srv import Transition
-from kr_tracker_msgs.msg import VelocityGoal
-from std_msgs.msg import Float32MultiArray
 
 
 class GUIWidget(QtWidgets.QWidget):
@@ -89,25 +84,33 @@ class GUIWidget(QtWidgets.QWidget):
         self.execution_start_time = None
         self.execution_duration = 1.0
 
-        # publish topic (configurable if needed)
-        self.publish_topic = '/velocity_goal'
-
     def call_service(self, srv_name: str):
         # Create client and call; node/executor running in background thread will handle it
         client = self.node.create_client(Trigger, srv_name)
-        if not client.wait_for_service(timeout_sec=1.0):
-            QtWidgets.QMessageBox.warning(self, 'Service missing', f'{srv_name} not available')
+        # give a bit more time for services to appear
+        self.node.get_logger().info(f'Attempting to call service "{srv_name}" from GUI (node ns={self.node.get_namespace()})')
+        if not client.wait_for_service(timeout_sec=5.0):
+            # log and notify user
+            self.node.get_logger().warning(f'Service {srv_name} not available (wait timed out)')
+            QtWidgets.QMessageBox.warning(self, 'Service missing', f'{srv_name} not available (timed out)')
             return
         req = Trigger.Request()
-        fut = client.call_async(req)
+        try:
+            fut = client.call_async(req)
+        except Exception as e:
+            self.node.get_logger().error(f'Failed to call service {srv_name}: {e}')
+            QtWidgets.QMessageBox.warning(self, 'Service error', f'Failed to call {srv_name}: {e}')
+            return
 
         # attach a callback
         def done_callback(future):
             try:
                 res = future.result()
-                # schedule GUI message in the Qt event loop (avoid calling Qt from rclpy thread)
+                # log and schedule GUI message in the Qt event loop (avoid calling Qt from rclpy thread)
+                self.node.get_logger().info(f'Service {srv_name} response: success={res.success} message="{res.message}"')
                 QtCore.QTimer.singleShot(0, lambda: QtWidgets.QMessageBox.information(self, 'Service response', str(res.success) + ': ' + res.message))
             except Exception as e:
+                self.node.get_logger().warning(f'Service {srv_name} call failed: {e}')
                 QtCore.QTimer.singleShot(0, lambda: QtWidgets.QMessageBox.warning(self, 'Service error', str(e)))
 
         fut.add_done_callback(done_callback)
@@ -136,14 +139,12 @@ class GUIWidget(QtWidgets.QWidget):
         fut.add_done_callback(done)
 
     def on_start(self):
-        # enable publishing; velocities will be computed from subscribed flow data
-        self.publishing = True
-        QtWidgets.QMessageBox.information(self, 'Started', f'Started publishing to {self.publish_topic}')
+        # Request the manager node to start publishing
+        self.call_service('velocity_flow_manager/start')
 
     def on_stop(self):
-        # stop publishing (the background publisher will publish zeros)
-        self.publishing = False
-        QtWidgets.QMessageBox.information(self, 'Stopped', f'Stopped publishing to {self.publish_topic}')
+        # Request the manager node to stop publishing
+        self.call_service('velocity_flow_manager/stop')
 
 
 class RclpyThread(threading.Thread):
@@ -163,94 +164,13 @@ class RclpyThread(threading.Thread):
         # give a moment for spin loop to exit
         self.executor.remove_node(self.node)
 
-def reshape_multiarray(msg: Float32MultiArray):
-    c, h, w = msg.layout.dim[0].size, msg.layout.dim[1].size, msg.layout.dim[2].size
-    flow = msg.data
-
-    flow = np.array(flow).reshape(c, h, w)
-
-    return flow
-
-
-def compute_desired_velocity(flow):
-    """Placeholder: compute desired (vx, vy, vz, vyaw) from flow array.
-
-    flow: nested list or None. For now return zeros; user will implement.
-    """
-    if flow is None:
-        return 0.0, 0.0, 0.0
-    
-    mag_filter = 3 # pixels
-    
-    flow_width = flow.shape[2]
-    flow_height = flow.shape[1]
-    u = flow[0, :, :]  # horizontal flow
-    v = flow[1, :, :]  # vertical flow
-    u *= flow_width
-    v *= flow_height
-
-    magnitude = np.sqrt(u**2 + v**2)
-    magnitude[magnitude < mag_filter] = 0.0
-
-    if magnitude.sum() < 10:
-        return 0.0, 0.0, 0.0
-    
-    # cluster flow vectors, should be at least 50 pixels, run connectedcomponents
-    # create a binary mask of significant motion
-    mask = (magnitude >= mag_filter).astype(np.uint8)    
-
-    # connected components on mask
-    clusters = []
-    if mask.sum() > 0:
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
-        # stats columns: [left, top, width, height, area]
-        for lbl in range(1, num_labels):
-            area = int(stats[lbl, 4])
-            if area < 50:
-                continue
-            left = int(stats[lbl, 0])
-            top = int(stats[lbl, 1])
-            width_box = int(stats[lbl, 2])
-            height_box = int(stats[lbl, 3])
-            cx, cy = centroids[lbl]
-
-            # compute average vector inside this cluster
-            mask_lbl = (labels == lbl)
-            if np.count_nonzero(mask_lbl) == 0:
-                continue
-            avg_u_comp = np.mean(u[mask_lbl])
-            avg_v_comp = np.mean(v[mask_lbl])
-
-            clusters.append({
-                'label': lbl,
-                'area': area,
-                'bbox': (left, top, width_box, height_box),
-                'centroid': (cx, cy),
-                'avg_u': avg_u_comp,
-                'avg_v': avg_v_comp,
-            })
-    
-    velocity_vector = (0.0, 0.0, 0.0)
-    # average flow vectors in biggest cluster
-    if len(clusters) > 0:
-        cluster = clusters[0]
-        centroid = cluster['centroid']
-        if centroid[0] < flow_width / 2:            
-            # send velocity vector to right (in vicon coordinate frame)
-            velocity_vector = np.array([0.5, 0.0, 0.0])  # vx, vy, vz
-        else:
-            velocity_vector = np.array([-0.5, 0.0, 0.0])  # vx, vy, vz
-    
-    return velocity_vector
-
-
 def main(args=None):
     if not PYQT_AVAILABLE:
         print('PyQt5 not available. Install python3-pyqt5 or PyQt5 from pip to run the GUI.')
         return
 
     rclpy.init(args=args)
-    node = Node('velocity_manager_node')
+    node = Node('velocity_flow_gui')
 
     app = QtWidgets.QApplication(sys.argv)
     widget = GUIWidget(node)
@@ -259,92 +179,12 @@ def main(args=None):
     spinner = RclpyThread(node)
     spinner.start()
 
-    # declare/read parameter for publish topic (similar to waypoint_manager)
-    publish_topic_param = node.declare_parameter('publish_topic', widget.publish_topic)
-    publish_topic = publish_topic_param.value
-    pub = node.create_publisher(VelocityGoal, publish_topic, 10)
-
-    # subscribe to flow raw data and store latest into widget.latest_flow
-    def flow_cb(msg: Float32MultiArray):
-        # node.get_logger().info('Received flow raw message')
-        arr = reshape_multiarray(msg) # (2, 256, 320)
-        # store raw flow array (do not touch Qt widgets from this thread)
-        widget.latest_flow = arr
-
-        # only trigger this once
-        if not widget.executing_dodge and not widget.executed_once:
-            vx, vy, vz = compute_desired_velocity(widget.latest_flow)
-            if abs(vx) > 0.0 or abs(vy) > 0.0 or abs(vz) > 0.0:
-                widget.executing_dodge = True
-                widget.execution_velocity = (vx, vy, vz)
-                curr_time = node.get_clock().now()
-                widget.execution_start_time = curr_time
-                node.get_logger().info(f'Starting dodge maneuver with velocity ({vx}, {vy}, {vz})')
-
-    sub = node.create_subscription(Float32MultiArray, '/flow/raw', flow_cb, 10)
-
-    def timer_cb():
-        # timer runs in the node's executor thread, safe to access widget attrs
-        msg = VelocityGoal()
-        if widget.publishing:
-            if widget.executing_dodge:
-                vx, vy, vz = widget.execution_velocity
-                msg.vx = float(vx)
-                msg.vy = float(vy)
-                msg.vz = float(vz)
-                msg.vyaw = 0.0
-
-                curr_time = node.get_clock().now()
-                elapsed = (curr_time - widget.execution_start_time).nanoseconds / 1e9
-                if elapsed >= widget.execution_duration:
-                    # finished dodge
-                    widget.executing_dodge = False
-                    widget.executed_once = True
-                    widget.execution_velocity = None
-                    widget.execution_start_time = None
-                    msg.vx = 0.0
-                    msg.vy = 0.0
-                    msg.vz = 0.0
-                    msg.vyaw = 0.0
-                    node.get_logger().info('Finished dodge maneuver')                
-                else:
-                    # continue executing dodge
-                    vx, vy, vz = widget.execution_velocity
-                    msg.vx = float(vx)
-                    msg.vy = float(vy)
-                    msg.vz = float(vz)
-                    msg.vyaw = 0.0
-            else:
-                msg.vx = 0.0
-                msg.vy = 0.0
-                msg.vz = 0.0
-                msg.vyaw = 0.0
-        else:
-            # node.get_logger().info('Not updating, sending zeros')
-            msg.vx = 0.0
-            msg.vy = 0.0
-            msg.vz = 0.0
-            msg.vyaw = 0.0
-        msg.use_position_gains = False
-        try:
-            pub.publish(msg)
-        except Exception:
-            pass
-
-    timer_period = 0.02
-    timer = node.create_timer(timer_period, timer_cb)
-
     widget.show()
     try:
         rc = app.exec_()
     finally:
         # cleanup
         spinner.stop()
-        # cancel timer and let node destroy it
-        try:
-            timer.cancel()
-        except Exception:
-            pass
         node.destroy_node()
         rclpy.shutdown()
 

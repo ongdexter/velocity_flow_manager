@@ -11,13 +11,21 @@ def generate_launch_description():
         description='Robot namespace'
     )
 
+    publish_topic_arg = DeclareLaunchArgument('publish_topic',
+                                              default_value='trackers_manager/velocity_tracker/goal',
+                                              description='Velocity publish topic')
+
+    publish_topic = LaunchConfiguration('publish_topic')
+
     return LaunchDescription([
         robot_arg,
+        publish_topic_arg,
         Node(
             package='velocity_flow_manager',
-            executable='velocity_flow_gui',
-            name='velocity_flow_gui',
+            executable='velocity_flow_manager',
+            name='velocity_flow_manager',
             namespace=LaunchConfiguration('robot'),
             output='screen',
+            parameters=[{'publish_topic': publish_topic}]
         )
     ])
