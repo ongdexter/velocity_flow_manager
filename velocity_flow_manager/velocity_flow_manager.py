@@ -96,9 +96,9 @@ def compute_desired_velocity(flow):
         cluster = clusters[0]
         centroid = cluster['centroid']
         if centroid[0] < flow_width / 2:
-            velocity_vector = (2.0, 0.0, 0.0)
+            velocity_vector = (1.0, 0.0, 0.0)
         else:
-            velocity_vector = (-2.0, 0.0, 0.0)
+            velocity_vector = (-1.0, 0.0, 0.0)
 
     return velocity_vector
 
@@ -122,6 +122,15 @@ class VelocityFlowManager(Node):
 
         # subscription
         self.create_subscription(Float32MultiArray, '/flow/raw', self._flow_cb, 10)
+
+        # wait for flow subscription to be ready
+        self.get_logger().info('Waiting for /flow/raw topic to be published...')
+        while not rclpy.ok():
+            topics = self.get_topic_names_and_types()
+            topic_names = [t[0] for t in topics]
+            if '/flow/raw' in topic_names:
+                break
+            rclpy.spin_once(self, timeout_sec=0.1)
 
         # services to control publishing
         self.create_service(Trigger, 'velocity_flow_manager/start', self._on_start)
@@ -153,6 +162,7 @@ class VelocityFlowManager(Node):
 
     def _on_start(self, request, response):
         self.publishing = True
+        self.executed_once = False
         response.success = True
         response.message = 'started'
         self.get_logger().info('Velocity-flow controller started')
